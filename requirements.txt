@@ -1,0 +1,10 @@
+gymnasium==0.29.1
+numpy==1.26.0
+pandas>=2.1.0
+pygame==2.5.2
+stable-baselines3==2.1.0
+shimmy>=0.2.1
+torch>=2.0.0
+tqdm
+matplotlib
+scikit-learn

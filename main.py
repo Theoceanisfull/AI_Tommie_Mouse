@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import numpy as np
 import pandas as pd
 import torch
@@ -7,7 +8,7 @@ import matplotlib.pyplot as plt
 from stable_baselines3.common.monitor import Monitor
 
 from src.maze_generator import MazeGenerator
-from src.mouse_env import MouseMazeEnv
+from src.mouse_env import MouseMazeEnv, MouseMazeEnvLegacy, SimpleMazeEnv
 from src.agents import (
     get_ppo_model,
     get_dqn_model,
@@ -20,6 +21,18 @@ from src.agents import (
 DATA_DIR = "data"
 MODEL_DIR = "models"
 os.makedirs(MODEL_DIR, exist_ok=True)
+
+
+def ea_checkpoint_path(env_name: str):
+    return os.path.join(MODEL_DIR, f"ea_{env_name}.pth")
+
+
+def make_env(maze, optimal_path=None, render_mode=None, env_name="mouse"):
+    if env_name == "simple":
+        return SimpleMazeEnv(maze, render_mode=render_mode)
+    if env_name == "mouse_legacy":
+        return MouseMazeEnvLegacy(maze, optimal_path=optimal_path, render_mode=render_mode)
+    return MouseMazeEnv(maze, optimal_path=optimal_path, render_mode=render_mode)
 
 def load_random_maze(complexity="Easy", split="train"):
     """Loads a random maze of specific complexity from dataset"""
@@ -52,7 +65,7 @@ def _direction_to_action(prev, curr):
     return mapping.get((dr, dc), None)
 
 
-def build_imitation_dataset(limit=200, split="train"):
+def build_imitation_dataset(limit=200, split="train", env_name="mouse"):
     """Collect (obs, action) pairs by walking optimal paths."""
     meta_path = os.path.join(DATA_DIR, "maze_metadata.csv")
     if not os.path.exists(meta_path):
@@ -80,7 +93,7 @@ def build_imitation_dataset(limit=200, split="train"):
             if os.path.exists(path_path):
                 path = np.load(path_path)
 
-        env = MouseMazeEnv(maze, optimal_path=path)
+        env = make_env(maze, optimal_path=path, env_name=env_name)
         path_seq = path.tolist() if path is not None else env._compute_optimal_path()[0]
 
         if path_seq is None or len(path_seq) < 2:
@@ -146,6 +159,8 @@ def evaluate_policy(algo, model, env, optimal_steps, episodes=10):
     results = []
     for _ in range(episodes):
         obs, _ = env.reset()
+        if algo == "ea" and hasattr(model, "reset_state"):
+            model.reset_state()
         steps = 0
         done = False
         success = False
@@ -171,18 +186,81 @@ def evaluate_policy(algo, model, env, optimal_steps, episodes=10):
     ratios = [s[1] for s in results]
     return float(np.mean(successes)), float(np.mean(ratios))
 
-def train(algo, episodes=1000):
+
+def load_imitation(env, env_name):
+    obs_dim = int(np.prod(env.observation_space.shape))
+    model = ImitationAgent(obs_dim, env.action_space.n)
+    ckpt_path = f"{MODEL_DIR}/imitation_{env_name}.pth"
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    model.load_state_dict(ckpt)
+    return model
+
+
+def evaluate_imitation(difficulty="Medium", env_name="mouse", runs=50):
+    """
+    Evaluate imitation agent on random test mazes without rendering.
+    Saves a simple plot to models/imitation_eval.png.
+    """
+    successes = []
+    step_ratios = []
+    for i in range(runs):
+        maze_bundle = load_random_maze(difficulty, split="test")
+        if maze_bundle is None:
+            print("No maze available to evaluate. Generate data first.")
+            return
+        maze, optimal_steps, path = maze_bundle
+        env = make_env(maze, optimal_path=path, render_mode=None, env_name=env_name)
+        model = load_imitation(env, env_name)
+        if hasattr(model, "reset_state"):
+            model.reset_state()
+        obs, _ = env.reset()
+        done = False
+        steps = 0
+        success = False
+        while not done and steps < env.max_steps:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            steps += 1
+            if terminated:
+                success = True
+        successes.append(1 if success else 0)
+        step_ratios.append(steps / max(1, optimal_steps))
+        env.close()
+
+    success_rate = float(np.mean(successes))
+    avg_step_ratio = float(np.mean(step_ratios))
+    print(f"Imitation eval on {runs} runs [{difficulty}]: success_rate={success_rate:.2f}, avg_step_ratio={avg_step_ratio:.2f}")
+
+    # Plot
+    fig, axes = plt.subplots(2, 1, figsize=(8, 6))
+    axes[0].plot(np.cumsum(successes) / np.arange(1, len(successes) + 1))
+    axes[0].set_ylabel("Cumulative Success Rate")
+    axes[0].grid(True)
+
+    axes[1].plot(np.cumsum(step_ratios) / np.arange(1, len(step_ratios) + 1))
+    axes[1].set_ylabel("Cumulative Step Ratio")
+    axes[1].set_xlabel("Episodes")
+    axes[1].grid(True)
+
+    out_path = os.path.join(MODEL_DIR, "imitation_eval.png")
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close(fig)
+    print(f"Saved eval plot to {out_path}")
+
+def train(algo, episodes=1000, env_name="mouse"):
     print(f"Training {algo}...")
     
     # For simplicity in this demo, we train on ONE medium maze to prove concept.
     # In a real full run, you would wrap the env to cycle through mazes.
-    maze_bundle = load_random_maze("Medium", split="train")
+    maze_bundle = load_random_maze("Easy", split="train")
     if maze_bundle is None:
         return
     maze, optimal, path = maze_bundle
-    eval_bundle = load_random_maze("Medium", split="test") or maze_bundle
+    eval_bundle = load_random_maze("Easy", split="test") or maze_bundle
 
-    env = MouseMazeEnv(maze, optimal_path=path)
+    env = make_env(maze, optimal_path=path, env_name=env_name)
     env = Monitor(env)
 
     if algo == "ppo":
@@ -190,7 +268,7 @@ def train(algo, episodes=1000):
         model.learn(total_timesteps=episodes * 20) # approx steps
         model.save(f"{MODEL_DIR}/ppo_mouse")
         eval_maze, eval_optimal, eval_path = eval_bundle
-        eval_env = MouseMazeEnv(eval_maze, optimal_path=eval_path)
+        eval_env = make_env(eval_maze, optimal_path=eval_path, env_name=env_name)
         success_rate, avg_ratio = evaluate_policy("ppo", model, eval_env, eval_optimal)
         print(f"PPO eval success rate: {success_rate:.2f}, step ratio: {avg_ratio:.2f}")
     
@@ -199,16 +277,38 @@ def train(algo, episodes=1000):
         model.learn(total_timesteps=episodes * 20)
         model.save(f"{MODEL_DIR}/dqn_mouse")
         eval_maze, eval_optimal, eval_path = eval_bundle
-        eval_env = MouseMazeEnv(eval_maze, optimal_path=eval_path)
+        eval_env = make_env(eval_maze, optimal_path=eval_path, env_name=env_name)
         success_rate, avg_ratio = evaluate_policy("dqn", model, eval_env, eval_optimal)
         print(f"DQN eval success rate: {success_rate:.2f}, step ratio: {avg_ratio:.2f}")
         
     elif algo == "ea":
-        trainer = EvolutionaryTrainer(maze, generations=20)
-        best_agent = trainer.train()
-        torch.save(best_agent.state_dict(), f"{MODEL_DIR}/ea_mouse.pth")
+        env_kwargs = {"optimal_path": path} if env_name != "simple" else {}
+        # Build a small curriculum batch of Easy mazes for EA to train against
+        curriculum = [maze]
+        for _ in range(3):
+            extra = load_random_maze("Easy", split="train")
+            if extra is not None:
+                curriculum.append(extra[0])
+
+        trainer = EvolutionaryTrainer(
+            curriculum,
+            generations=30,
+            population_size=100,
+            env_cls=SimpleMazeEnv if env_name == "simple" else MouseMazeEnv,
+            env_kwargs=env_kwargs,
+        )
+        best_agent, _ = trainer.train()
+        torch.save(
+            {
+                "state_dict": best_agent.state_dict(),
+                "input_dim": int(np.prod(env.observation_space.shape)),
+                "output_dim": env.action_space.n,
+                "env_name": env_name,
+            },
+            ea_checkpoint_path(env_name),
+        )
         eval_maze, eval_optimal, eval_path = eval_bundle
-        eval_env = MouseMazeEnv(eval_maze, optimal_path=eval_path)
+        eval_env = make_env(eval_maze, optimal_path=eval_path, env_name=env_name)
         success_rate, avg_ratio = evaluate_policy("ea", best_agent, eval_env, eval_optimal)
         print(f"EA eval success rate: {success_rate:.2f}, step ratio: {avg_ratio:.2f}")
 
@@ -226,13 +326,13 @@ def train(algo, episodes=1000):
             title="Q-Learning Training"
         )
         eval_maze, eval_optimal, eval_path = eval_bundle
-        eval_env = MouseMazeEnv(eval_maze, optimal_path=eval_path)
+        eval_env = make_env(eval_maze, optimal_path=eval_path, env_name=env_name)
         success_rate, avg_ratio = evaluate_policy("qlearn", agent, eval_env, eval_optimal)
         print(f"Q-learning eval success rate: {success_rate:.2f}, step ratio: {avg_ratio:.2f}")
         
     elif algo == "imitation":
         print("Building expert trajectories for imitation...")
-        obs_data, act_data = build_imitation_dataset(limit=300, split="train")
+        obs_data, act_data = build_imitation_dataset(limit=300, split="train", env_name=env_name)
         if obs_data is None:
             print("Imitation training aborted: no expert data.")
             return
@@ -254,26 +354,26 @@ def train(algo, episodes=1000):
             epoch_losses.append(avg_loss)
             if (epoch + 1) % 2 == 0 or epoch == epochs - 1:
                 print(f"Epoch {epoch+1}/{epochs} - loss: {avg_loss:.4f}")
-        torch.save(agent.state_dict(), f"{MODEL_DIR}/imitation_mouse.pth")
+        torch.save(agent.state_dict(), f"{MODEL_DIR}/imitation_{env_name}.pth")
         plot_training_curves(
             os.path.join(MODEL_DIR, "imitation_training.png"),
             losses=epoch_losses,
             title="Imitation Training Loss"
         )
         eval_maze, eval_optimal, eval_path = eval_bundle
-        eval_env = MouseMazeEnv(eval_maze, optimal_path=eval_path)
+        eval_env = make_env(eval_maze, optimal_path=eval_path, env_name=env_name)
         success_rate, avg_ratio = evaluate_policy("imitation", agent, eval_env, eval_optimal)
         print(f"Imitation eval success rate: {success_rate:.2f}, step ratio: {avg_ratio:.2f}")
 
     print(f"{algo} training complete.")
 
-def visualize(algo, difficulty):
+def visualize(algo, difficulty, env_name="mouse"):
     maze_bundle = load_random_maze(difficulty, split="test")
     if maze_bundle is None:
         print("No maze available to visualize. Generate data first.")
         return
     maze, optimal_steps, path = maze_bundle
-    env = MouseMazeEnv(maze, optimal_path=path, render_mode="human")
+    env = make_env(maze, optimal_path=path, render_mode="human", env_name=env_name)
     
     model = None
     
@@ -286,16 +386,43 @@ def visualize(algo, difficulty):
             model = DQN.load(f"{MODEL_DIR}/dqn_mouse")
         elif algo == "ea":
             from src.agents import SimpleEvolutionaryAgent
-            h, w = maze.shape
-            model = SimpleEvolutionaryAgent(h*w, 8)
-            model.load_state_dict(torch.load(f"{MODEL_DIR}/ea_mouse.pth"))
+            ckpt_path = ea_checkpoint_path(env_name)
+            # Allow legacy checkpoints: try safe weights-only load, then fallback.
+            import torch.serialization as ts
+
+            ts.add_safe_globals([np.core.multiarray.scalar])
+            try:
+                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+            except Exception:
+                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            if isinstance(ckpt, dict) and "state_dict" in ckpt:
+                state_dict = ckpt["state_dict"]
+                input_dim = ckpt.get("input_dim", int(np.prod(env.observation_space.shape)))
+                output_dim = ckpt.get("output_dim", env.action_space.n)
+            else:
+                state_dict = ckpt
+                input_dim = int(np.prod(env.observation_space.shape))
+                output_dim = env.action_space.n
+
+            expected_in = int(np.prod(env.observation_space.shape))
+            expected_out = env.action_space.n
+            if input_dim != expected_in or output_dim != expected_out:
+                print(f"EA checkpoint mismatch (ckpt dims {input_dim}/{output_dim} vs env {expected_in}/{expected_out}). Train EA for env '{env_name}' or load matching checkpoint.")
+                return
+
+            model = SimpleEvolutionaryAgent(input_dim, output_dim)
+            missing_keys = set(model.state_dict().keys()) - set(state_dict.keys())
+            if missing_keys:
+                print("EA checkpoint architecture mismatch (missing keys). Retrain EA for this env after the LSTM change.")
+                return
+            model.load_state_dict(state_dict, strict=False)
         elif algo == "qlearn":
             model = QLearningAgent(action_size=8)
             model.load(os.path.join(MODEL_DIR, "qlearn_mouse.pkl"))
         elif algo == "imitation":
             obs_dim = int(np.prod(env.observation_space.shape))
             model = ImitationAgent(obs_dim, env.action_space.n)
-            model.load_state_dict(torch.load(f"{MODEL_DIR}/imitation_mouse.pth"))
+            model.load_state_dict(torch.load(f"{MODEL_DIR}/imitation_{env_name}.pth"))
     except FileNotFoundError:
         print(f"Model {algo} not found. Train it first.")
         return
@@ -303,6 +430,10 @@ def visualize(algo, difficulty):
     print(f"Visualizing {algo} on {difficulty} maze. Optimal Steps: {optimal_steps}")
     
     obs, _ = env.reset()
+    if algo == "ea" and hasattr(model, "reset_state"):
+        model.reset_state()
+    if algo == "imitation" and hasattr(model, "reset_state"):
+        model.reset_state()
     done = False
     
     while not done:
@@ -322,20 +453,40 @@ def visualize(algo, difficulty):
         if terminated:
             print("Mouse found the cheese!")
     
+    # Keep the window open until user acknowledges (prevents instant close)
+    if env.render_mode == "human":
+        try:
+            input("Press Enter to close the visualization window...")
+        except EOFError:
+            pass
+
     env.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["generate", "train", "visualize"], required=True)
+    parser.add_argument("--mode", choices=["generate", "train", "visualize", "evaluate"], required=True)
     parser.add_argument("--algo", choices=["ppo", "dqn", "ea", "imitation", "qlearn"], default="ppo")
     parser.add_argument("--difficulty", choices=["Easy", "Medium", "Hard"], default="Medium")
+    parser.add_argument(
+        "--env",
+        choices=["mouse", "mouse_legacy", "simple"],
+        default=None,
+        help="Environment type to use (default: mouse, EA defaults to simple).",
+    )
+    parser.add_argument("--eval-runs", type=int, default=50, help="Number of evaluation runs (for evaluate mode).")
     
     args = parser.parse_args()
+    env_name = args.env if args.env is not None else ("simple" if args.algo == "ea" else "mouse")
     
     if args.mode == "generate":
         gen = MazeGenerator(DATA_DIR)
         gen.generate_dataset()
     elif args.mode == "train":
-        train(args.algo)
+        train(args.algo, env_name=env_name)
     elif args.mode == "visualize":
-        visualize(args.algo, args.difficulty)
+        visualize(args.algo, args.difficulty, env_name=env_name)
+    elif args.mode == "evaluate":
+        if args.algo != "imitation":
+            print("Evaluate mode currently supports imitation only.")
+            sys.exit(1)
+        evaluate_imitation(args.difficulty, env_name=env_name, runs=args.eval_runs)

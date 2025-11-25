@@ -708,11 +708,11 @@ class QLearningAgent:
     def __init__(
         self,
         action_size: int,
-        lr: float = 0.2,
+        lr: float = 0.3,
         gamma: float = 0.99,
         epsilon: float = 1.0,
-        epsilon_min: float = 0.05,
-        epsilon_decay: float = 0.995,
+        epsilon_min: float = 0.01,
+        epsilon_decay: float = 0.99,
     ):
         self.action_size = action_size
         self.lr = lr
@@ -722,21 +722,23 @@ class QLearningAgent:
         self.epsilon_decay = epsilon_decay
         self.q_table: Dict[Tuple[float, ...], np.ndarray] = {}
 
-    def _get_state_key(self, obs: np.ndarray) -> Tuple[float, ...]:
-        # Discretize observation to 2 decimal places to bound table size
+    def _get_state_key(self, obs: np.ndarray, pos: Tuple[int, int] | None = None) -> Tuple[float, ...]:
+        # Prefer exact agent position if provided (for grid worlds), otherwise discretize obs
+        if pos is not None:
+            return tuple(pos)
         return tuple(np.round(obs, 2))
 
-    def act(self, obs: np.ndarray, explore: bool = True) -> int:
-        state = self._get_state_key(obs)
+    def act(self, obs: np.ndarray, explore: bool = True, pos: Tuple[int, int] | None = None) -> int:
+        state = self._get_state_key(obs, pos=pos)
         if state not in self.q_table:
             self.q_table[state] = np.zeros(self.action_size, dtype=np.float32)
         if explore and np.random.rand() < self.epsilon:
             return np.random.randint(self.action_size)
         return int(np.argmax(self.q_table[state]))
 
-    def update(self, obs, action, reward, next_obs, done: bool):
-        state = self._get_state_key(obs)
-        next_state = self._get_state_key(next_obs)
+    def update(self, obs, action, reward, next_obs, done: bool, pos=None, next_pos=None):
+        state = self._get_state_key(obs, pos=pos)
+        next_state = self._get_state_key(next_obs, pos=next_pos)
 
         if state not in self.q_table:
             self.q_table[state] = np.zeros(self.action_size, dtype=np.float32)
@@ -764,10 +766,12 @@ class QLearningAgent:
 
 def train_q_learning(env, episodes: int = 500, max_steps: int = 500):
     """
-    Clean Q-learning trainer:
-    - No smell hacks
-    - No stall heuristics
-    Just step, update, move on.
+    Q-learning trainer with simple, goal-oriented rewards suitable for SimpleMazeEnv:
+    - Step: -0.1
+    - Crash: -1.0
+    - Move closer to goal: +0.1
+    - Move farther from goal: -0.05
+    - Goal: +10
     """
     agent = QLearningAgent(action_size=env.action_space.n)
     rewards = []
@@ -781,11 +785,33 @@ def train_q_learning(env, episodes: int = 500, max_steps: int = 500):
         steps = 0
 
         for t in range(max_steps):
-            action = agent.act(obs, explore=True)
-            next_obs, reward, terminated, truncated, _ = env.step(action)
+            pos = getattr(env, "agent_pos", None)
+            action = agent.act(obs, explore=True, pos=pos)
+            next_obs, _, terminated, truncated, info = env.step(action)
             done = terminated or truncated
 
-            agent.update(obs, action, reward, next_obs, done)
+            crashed = False
+            old_dist = 0.0
+            new_dist = 0.0
+            if isinstance(info, dict):
+                crashed = info.get("crashed", False)
+                old_dist = info.get("old_dist", 0.0)
+                new_dist = info.get("new_dist", old_dist)
+
+            # Custom reward
+            reward = -0.1
+            if crashed:
+                reward -= 1.0
+            else:
+                if new_dist < old_dist:
+                    reward += 0.1
+                elif new_dist > old_dist:
+                    reward -= 0.05
+            if terminated:
+                reward += 10.0
+
+            next_pos = getattr(env, "agent_pos", None)
+            agent.update(obs, action, reward, next_obs, done, pos=pos, next_pos=next_pos)
 
             obs = next_obs
             ep_reward += reward

@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from stable_baselines3.common.monitor import Monitor
 
 from src.maze_generator import MazeGenerator
-from src.mouse_env import MouseMazeEnv, MouseMazeEnvLegacy, SimpleMazeEnv
+from src.mouse_env import SimpleMazeEnv
 from src.agents import (
     get_ppo_model,
     get_dqn_model,
@@ -27,15 +27,11 @@ def ea_checkpoint_path(env_name: str):
     return os.path.join(MODEL_DIR, f"ea_{env_name}.pth")
 
 
-def make_env(maze, optimal_path=None, render_mode=None, env_name="mouse"):
-    if env_name == "simple":
-        return SimpleMazeEnv(maze, render_mode=render_mode)
-    if env_name == "mouse_legacy":
-        return MouseMazeEnvLegacy(maze, optimal_path=optimal_path, render_mode=render_mode)
-    return MouseMazeEnv(maze, optimal_path=optimal_path, render_mode=render_mode)
+def make_env(maze, optimal_path=None, render_mode=None, env_name="simple"):
+    return SimpleMazeEnv(maze, render_mode=render_mode)
 
-def load_random_maze(complexity="Easy", split="train"):
-    """Loads a random maze of specific complexity from dataset"""
+def load_random_maze(complexity="Easy", split="train", maze_type=None):
+    """Loads a random maze of specific difficulty (and optional type) from dataset"""
     meta_path = os.path.join(DATA_DIR, "maze_metadata.csv")
     if not os.path.exists(meta_path):
         print("No dataset found. Run generation first.")
@@ -43,6 +39,8 @@ def load_random_maze(complexity="Easy", split="train"):
     
     df = pd.read_csv(meta_path)
     filtered = df[df["difficulty"] == complexity]
+    if maze_type:
+        filtered = filtered[filtered["type"] == maze_type]
     if "split" in filtered.columns and split:
         filtered = filtered[filtered["split"] == split]
     if filtered.empty:
@@ -170,7 +168,8 @@ def evaluate_policy(algo, model, env, optimal_steps, episodes=10):
             elif algo == "ea":
                 action = model.select_action(obs)
             elif algo == "qlearn":
-                action = model.act(obs, explore=False)
+                pos = getattr(env, "agent_pos", None)
+                action = model.act(obs, explore=False, pos=pos)
             else:
                 action = env.action_space.sample()
             obs, _, terminated, truncated, _ = env.step(action)
@@ -249,16 +248,14 @@ def evaluate_imitation(difficulty="Medium", env_name="mouse", runs=50):
     plt.close(fig)
     print(f"Saved eval plot to {out_path}")
 
-def train(algo, episodes=1000, env_name="mouse"):
+def train(algo, episodes=1000, env_name="simple", difficulty="Medium", maze_type=None):
     print(f"Training {algo}...")
     
-    # For simplicity in this demo, we train on ONE medium maze to prove concept.
-    # In a real full run, you would wrap the env to cycle through mazes.
-    maze_bundle = load_random_maze("Easy", split="train")
+    maze_bundle = load_random_maze(difficulty, split="train", maze_type=maze_type)
     if maze_bundle is None:
         return
     maze, optimal, path = maze_bundle
-    eval_bundle = load_random_maze("Easy", split="test") or maze_bundle
+    eval_bundle = load_random_maze(difficulty, split="test", maze_type=maze_type) or maze_bundle
 
     env = make_env(maze, optimal_path=path, env_name=env_name)
     env = Monitor(env)
@@ -282,7 +279,7 @@ def train(algo, episodes=1000, env_name="mouse"):
         print(f"DQN eval success rate: {success_rate:.2f}, step ratio: {avg_ratio:.2f}")
         
     elif algo == "ea":
-        env_kwargs = {"optimal_path": path} if env_name != "simple" else {}
+        env_kwargs = {}
         # Build a small curriculum batch of Easy mazes for EA to train against
         curriculum = [maze]
         for _ in range(3):
@@ -294,7 +291,7 @@ def train(algo, episodes=1000, env_name="mouse"):
             curriculum,
             generations=30,
             population_size=100,
-            env_cls=SimpleMazeEnv if env_name == "simple" else MouseMazeEnv,
+            env_cls=SimpleMazeEnv,
             env_kwargs=env_kwargs,
         )
         best_agent, _ = trainer.train()
@@ -313,9 +310,26 @@ def train(algo, episodes=1000, env_name="mouse"):
         print(f"EA eval success rate: {success_rate:.2f}, step ratio: {avg_ratio:.2f}")
 
     elif algo == "qlearn":
-        agent, rewards, successes, step_ratios = train_q_learning(env, episodes=episodes, max_steps=env.max_steps, optimal_steps=optimal)
+        import time
+        start_time = time.time()
+
+        agent, rewards, successes, steps_per_episode = train_q_learning(
+            env, episodes=episodes, max_steps=env.max_steps
+        )
+        duration = time.time() - start_time
+        print(f"Q-learning training time: {duration:.2f} seconds")
+
         np.save(os.path.join(MODEL_DIR, "qlearn_rewards.npy"), np.array(rewards, dtype=np.float32))
-        agent.save(os.path.join(MODEL_DIR, "qlearn_mouse.pkl"))
+        suffix = maze_type if maze_type else "simple"
+        agent.save(os.path.join(MODEL_DIR, f"qlearn_{suffix}.pkl"))
+        # Save Q-table to CSV
+        q_csv = os.path.join(MODEL_DIR, f"q_table_{suffix}.csv")
+        with open(q_csv, "w") as f:
+            for state, values in agent.q_table.items():
+                f.write(f"{state}," + ",".join(f"{v:.4f}" for v in values) + "\n")
+        print(f"Saved Q-table to {q_csv}")
+
+        step_ratios = [s / max(1, optimal) for s in steps_per_episode]
         success_curve = np.cumsum(successes) / np.arange(1, len(successes) + 1)
         step_curve = np.cumsum(step_ratios) / np.arange(1, len(step_ratios) + 1)
         plot_training_curves(
@@ -367,8 +381,8 @@ def train(algo, episodes=1000, env_name="mouse"):
 
     print(f"{algo} training complete.")
 
-def visualize(algo, difficulty, env_name="mouse"):
-    maze_bundle = load_random_maze(difficulty, split="test")
+def visualize(algo, difficulty, env_name="simple", maze_type=None):
+    maze_bundle = load_random_maze(difficulty, split="test", maze_type=maze_type)
     if maze_bundle is None:
         print("No maze available to visualize. Generate data first.")
         return
@@ -417,8 +431,9 @@ def visualize(algo, difficulty, env_name="mouse"):
                 return
             model.load_state_dict(state_dict, strict=False)
         elif algo == "qlearn":
-            model = QLearningAgent(action_size=8)
-            model.load(os.path.join(MODEL_DIR, "qlearn_mouse.pkl"))
+            model = QLearningAgent(action_size=env.action_space.n)
+            suffix = args.complexity if args.complexity else "simple"
+            model.load(os.path.join(MODEL_DIR, f"qlearn_{suffix}.pkl"))
         elif algo == "imitation":
             obs_dim = int(np.prod(env.observation_space.shape))
             model = ImitationAgent(obs_dim, env.action_space.n)
@@ -467,24 +482,27 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["generate", "train", "visualize", "evaluate"], required=True)
     parser.add_argument("--algo", choices=["ppo", "dqn", "ea", "imitation", "qlearn"], default="ppo")
     parser.add_argument("--difficulty", choices=["Easy", "Medium", "Hard"], default="Medium")
+    parser.add_argument("--complexity", choices=["perfect", "imperfect"], default=None, help="Maze type filter (used for qlearn/visualize).")
     parser.add_argument(
         "--env",
-        choices=["mouse", "mouse_legacy", "simple"],
-        default=None,
-        help="Environment type to use (default: mouse, EA defaults to simple).",
+        choices=["simple"],
+        default="simple",
+        help="Environment type to use (simple env recommended for Q-learning).",
     )
     parser.add_argument("--eval-runs", type=int, default=50, help="Number of evaluation runs (for evaluate mode).")
     
     args = parser.parse_args()
-    env_name = args.env if args.env is not None else ("simple" if args.algo == "ea" else "mouse")
+    env_name = args.env
     
     if args.mode == "generate":
         gen = MazeGenerator(DATA_DIR)
         gen.generate_dataset()
     elif args.mode == "train":
-        train(args.algo, env_name=env_name)
+        # Use more episodes for Q-learning on Medium mazes
+        eps = 5000 if args.algo == "qlearn" else 1000
+        train(args.algo, episodes=eps, env_name=env_name, difficulty=args.difficulty, maze_type=args.complexity)
     elif args.mode == "visualize":
-        visualize(args.algo, args.difficulty, env_name=env_name)
+        visualize(args.algo, args.difficulty, env_name=env_name, maze_type=args.complexity)
     elif args.mode == "evaluate":
         if args.algo != "imitation":
             print("Evaluate mode currently supports imitation only.")

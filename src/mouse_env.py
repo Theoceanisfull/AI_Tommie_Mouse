@@ -615,13 +615,12 @@ class SimpleMazeEnv(gym.Env):
 
         # Check wall collision
         crashed = nr < 0 or nr >= self.height or nc < 0 or nc >= self.width or self.maze[nr, nc] == 1
+        old_dist = abs(self.goal_pos[0] - r) + abs(self.goal_pos[1] - c)
+        new_dist = abs(self.goal_pos[0] - nr) + abs(self.goal_pos[1] - nc)
         if crashed:
             reward -= 0.5  # crash penalty (kept small for EA stability)
         else:
             # Compute distance improvement
-            old_dist = abs(self.goal_pos[0] - r) + abs(self.goal_pos[1] - c)
-            new_dist = abs(self.goal_pos[0] - nr) + abs(self.goal_pos[1] - nc)
-
             if new_dist < old_dist:
                 reward += 1.0 * (old_dist - new_dist)  # closer to goal
             elif new_dist > old_dist:
@@ -648,7 +647,13 @@ class SimpleMazeEnv(gym.Env):
         if self.render_mode == "human":
             self.render()
 
-        return self._get_obs(), reward, terminated, truncated, {}
+        info = {
+            "crashed": crashed,
+            "old_dist": old_dist,
+            "new_dist": new_dist,
+        }
+
+        return self._get_obs(), reward, terminated, truncated, info
 
     def render(self):
         import pygame

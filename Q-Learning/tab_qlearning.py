@@ -1,18 +1,26 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from maze_env import MazeEnv
+import os
+import imageio.v2 as imageio
+import pygame
 
 
 # ---------------------------
 # 1. Define hyperparameters
 # ---------------------------
-EPISODES = 150        # total trainind episodes
+# Longer training + slower epsilon decay to keep exploring harder mazes
+EPISODES = 4000          # total training episodes
 MAX_STEPS = None         # set after env creation
 ALPHA = 0.1              # learning rate
 GAMMA = 0.95             # discount factor (value next state more)
 EPSILON = 1.0            # exploration probability
-EPSILON_DECAY = 0.995    # decay per episode
-EPSILON_MIN = 0.05       # floor for epsilon
+EPSILON_DECAY = 0.999    # slower decay to keep exploration
+EPSILON_MIN = 0.02       # allow occasional exploration late
+
+# Ensure metrics directory exists
+METRICS_DIR = "metrics"
+os.makedirs(METRICS_DIR, exist_ok=True)
 
 # ---------------------------
 # 2. Create environment (Medium perfect maze from dataset; harder than outer-wall trivial paths)
@@ -87,6 +95,7 @@ for episode in range(EPISODES):
 # ---------------------------
 # 5. Single test run with visualization
 # ---------------------------
+frames = []
 env.render_mode = "human"
 state, info = env.reset()
 done = False
@@ -94,12 +103,33 @@ for step in range(MAX_STEPS):
     action = np.argmax(Q[state, :])
     state, reward, terminated, truncated, info = env.step(action)
     done = terminated or truncated
+    # Capture frame if pygame display exists
+    surf = None
+    try:
+        surf = pygame.display.get_surface()
+    except Exception:
+        surf = None
+    if surf is not None:
+        frame = pygame.surfarray.array3d(surf).swapaxes(0, 1)
+        frames.append(frame)
     if done:
         break
 env.close()
 
+if frames:
+    video_path = os.path.join(METRICS_DIR, "q_learning_run.gif")
+    imageio.mimsave(video_path, frames, fps=10, format="GIF")
+    print(f"Saved run animation to {video_path}")
+
 # ---------------------------
-# 6. Plot training performance
+# 6. Save Q-table
+# ---------------------------
+qtable_path = os.path.join(METRICS_DIR, "q_table.csv")
+np.savetxt(qtable_path, Q, delimiter=",")
+print(f"Saved Q-table to {qtable_path}")
+
+# ---------------------------
+# 7. Plot training performance
 # ---------------------------
 plt.figure(figsize=(8, 5))
 plt.plot(episode_rewards, label="Episode reward")
@@ -109,4 +139,7 @@ plt.title("Q-Learning Training Progress")
 plt.grid(True)
 plt.legend()
 plt.tight_layout()
-plt.show()
+plot_path = os.path.join(METRICS_DIR, "training_rewards.png")
+plt.savefig(plot_path)
+plt.close()
+print(f"Saved training plot to {plot_path}")

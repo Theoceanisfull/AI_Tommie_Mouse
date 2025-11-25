@@ -645,6 +645,9 @@ class SimpleMazeEnv(gym.Env):
         if self.steps >= self.max_steps:
             truncated = True
 
+        if self.render_mode == "human":
+            self.render()
+
         return self._get_obs(), reward, terminated, truncated, {}
 
     def render(self):

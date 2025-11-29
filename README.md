@@ -1,14 +1,14 @@
 # AI Tommie Mouse
 
-Reinforcement Learning project where a mouse agent learns to navigate 2D mazes to find cheese. Includes custom Gymnasium environment, PyGame renderer, generated maze dataset with A* ground truth, and several baseline agents.
+Mouse-in-a-maze RL playground with custom Gymnasium environments, PyGame renderers, a generated maze corpus with A* ground truth, and multiple baselines (PPO/DQN/EA/tabular Q-learning/imitation). Data and code are organized to keep experiments isolated (per-training-type `metrics/`, shared `trained_models/`, shared `src/data`).
 
-## Features
-- Custom Gymnasium environments:
-  - `mouse`: PyGame rendering, egocentric FoV, turn memory, smell signal; legacy straight-move control used by imitation scripts.
-  - `simple`: 4-action, walls + goal-direction observation; tuned for EA/tabular/Q-learning/DQN baselines.
-- 4,000 generated mazes per difficulty (easy 11x11, medium 21x21, hard 31x31; perfect + imperfect) with A* optimal paths and lengths; stored under `src/data/{1111,2121,3131}` with `maze_metadata.csv`.
-- Baseline algorithms: PPO, DQN, Evolutionary Algorithm, Imitation Learning (A* demonstrations), tabular Q-Learning; curriculum DQN scripts.
-- Standalone trainers produce plots/GIFs under their local `metrics/` and save weights to `trained_models/`.
+## Highlights
+- **Environments**
+  - `mouse` (legacy straight-move): 4 actions (Up/Right/Down/Left), 8-tile FoV + orientation + turn memory (+ optional smell). Start=2, goal=3 must exist. PyGame render uses purple walls, 🐭 agent, 🧀 goal.
+  - `simple`: 4 actions, 6-D obs (walls up/right/down/left + normalized goal direction), tuned for EA/tabular/Q-learning/DQN.
+- **Data**: 4,000 mazes per difficulty (easy 11x11, medium 21x21, hard 31x31; perfect + imperfect) under `src/data/{1111,2121,3131}` with `maze_metadata.csv` and A* paths (`*_path.npy`).
+- **Baselines**: PPO, DQN, Evolutionary Algorithm, tabular Q-learning, Imitation Learning (A* demos). Standalone curriculum DQN scripts for single- and multi-maze training.
+- **Artifacts**: Each trainer writes plots/GIFs to its own `metrics/` folder and saves weights to `trained_models/`.
 
 ## Quick Start
 ```bash
@@ -71,9 +71,9 @@ python Q-Learning/test_dqn.py --batch ../data/maze_757.npy ../data/maze_755.npy
 ```
 
 ## Environment Details
-- **mouse env (legacy straight-move)**: 8-tile FoV + orientation one-hot + turn memory + optional smell; 4 actions (Up/Right/Down/Left); start=2, goal=3 markers required.
-- **simple env**: 6-D observation (walls up/right/down/left, normalized goal direction), 4 actions (up/right/down/left), sparse shaping toward goal, lighter dynamics tailored for evolutionary search.
-- Custom renderers: purple walls, mouse/cheese icons (pygame); start=2, goal=3 must exist or scripts will raise.
+- **mouse env (legacy straight-move)**: 8-tile FoV + orientation one-hot + turn memory (+ optional smell); 4 actions. Start=2, goal=3 required. Rewards: goal bonus, wall penalty, shaping toward goal. Purple-wall/emoji render.
+- **simple env**: 6-D observation (walls, normalized goal direction), 4 actions, sparse shaping, tuned for EA/tabular/DQN stability.
+- Rendering: PyGame with purple walls, 🐭 agent, 🧀 goal; ensure a display is available or use a headless backend if needed.
 
 ## Notes on Imitation Learning
 - Uses A* paths stored in `maze_metadata.csv` (`path_file` column) to collect (obs, action) pairs with `MouseMazeEnvLegacy`.
@@ -85,6 +85,13 @@ python Q-Learning/test_dqn.py --batch ../data/maze_757.npy ../data/maze_755.npy
 - `DQN_Single.py`: curriculum DQN on a single hard maze (`../src/data/3131/maze_1.npy`), saves model + reward plot + eval GIF (warns if goal not reached).
 - `DQN_Multi.py`: curriculum DQN across the Medium dataset (`src/data/2121`, 90/10 split), saves model, reward/success plots, test metrics CSV, and eval GIF.
 - `test_dqn.py`: load a saved DQN and run a greedy rollout on any maze, with optional render and GIF export.
+
+## Troubleshooting / Nuances
+- **Start/Goal markers**: all envs expect start=2, goal=3. Scripts now raise if missing (prevents silent looping GIFs).
+- **Headless PyGame**: if renders fail on a server, set `SDL_VIDEODRIVER=dummy` before running visualization scripts; GIF capture needs a surface.
+- **Imitation agent**: 2-layer LSTM with LR scheduler (ReduceLROnPlateau), grad clipping, dropout on the feedforward and LSTM (only when num_layers>1).
+- **Curriculum DQN**: both single and multi use one-hot state MLPs (256-128 heads). `DQN_Single` evaluates on the training maze for a deterministic GIF and warns if the goal is not reached.
+- **Data splits**: `maze_metadata.csv` carries a 90/10 train/test split; rerun the generator if missing. Paths are relative to `src/data/{1111,2121,3131}`.
 
 ## Repo Structure (recommended)
 - `src/data/{1111,2121,3131}`: generated mazes + metadata + optimal paths

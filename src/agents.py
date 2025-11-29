@@ -307,20 +307,48 @@ class EvolutionaryTrainer:
 # ============================================================
 
 class ImitationAgent(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim=128):
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        hidden_dim=256,
+        dropout=0.2,
+        grad_clip=1.0,
+        num_layers=2,
+        lr=0.001,
+    ):
         super().__init__()
-        self.embed = nn.Linear(input_dim, hidden_dim)
-        self.rnn = nn.LSTM(input_size=hidden_dim, hidden_size=hidden_dim, batch_first=True)
+        self.dropout = dropout
+        self.grad_clip = grad_clip
+        self.num_layers = num_layers
+        self.initial_lr = lr
+        self.embed = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+        )
+        self.rnn = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+            # LSTM dropout only applies when num_layers > 1
+            dropout=self.dropout if self.num_layers > 1 else 0.0,
+        )
         self.head = nn.Linear(hidden_dim, output_dim)
         self.hidden_dim = hidden_dim
-        self.optimizer = optim.Adam(self.parameters(), lr=0.001)
+        self.optimizer = optim.Adam(self.parameters(), lr=self.initial_lr)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, factor=0.5, patience=5, min_lr=1e-5
+        )
         self.criterion = nn.CrossEntropyLoss()
         self.hx = None
         self.cx = None
 
     def reset_state(self):
-        self.hx = torch.zeros(1, 1, self.hidden_dim)
-        self.cx = torch.zeros(1, 1, self.hidden_dim)
+        device = next(self.parameters()).device
+        self.hx = torch.zeros(self.num_layers, 1, self.hidden_dim, device=device)
+        self.cx = torch.zeros(self.num_layers, 1, self.hidden_dim, device=device)
 
     def forward_logits(self, obs, use_state=False):
         """
@@ -342,9 +370,21 @@ class ImitationAgent(nn.Module):
         logits = self.forward_logits(obs, use_state=False)
         loss = self.criterion(logits, target)
         loss.backward()
+        if self.grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip)
         self.optimizer.step()
         return loss.item()
         
+    def reset_lr(self):
+        """Reset optimizer LR to initial value (e.g., after a curriculum phase)."""
+        for g in self.optimizer.param_groups:
+            g["lr"] = self.initial_lr
+
+    def step_scheduler(self, metric):
+        """Advance LR scheduler with a validation/train metric (e.g., loss)."""
+        if self.scheduler is not None:
+            self.scheduler.step(metric)
+
     def predict(self, obs, deterministic=True):
         # Matches SB3 API roughly
         if isinstance(obs, np.ndarray):

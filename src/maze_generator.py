@@ -16,7 +16,7 @@ class MazeGenerator:
     def __init__(self, save_dir="data"):
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
-        
+
     def generate_maze(self, width, height, complexity="perfect"):
         """
         Generates a maze.
@@ -123,59 +123,65 @@ class MazeGenerator:
         path.append(start)
         return path[::-1], len(path) - 1
 
-    def generate_dataset(self):
-        print("Generating Dataset...")
-        dataset = []
-        configs = [
-            ("Easy", 11, 11),
-            ("Medium", 21, 21),
-            ("Hard", 31, 31)
-        ]
-        
-        # 2000 Perfect, 2000 Imperfect
-        # Split evenly across Easy/Med/Hard
-        
-        counts = {"perfect": 2000, "imperfect": 2000}
-        
-        all_mazes = {}
+    def _generate_level(self, level_name, width, height, total=4000):
+        """
+        Generate a full dataset for a single difficulty level.
+        Saves into a subfolder named after dimensions, e.g., data/2121 for 21x21.
+        """
+        level_dir = os.path.join(self.save_dir, f"{height}{width}")
+        os.makedirs(level_dir, exist_ok=True)
 
+        per_type = total // 2
+        records = []
         maze_id = 0
-        for m_type, total in counts.items():
-            per_level = total // 3
-            for level, h, w in configs:
-                print(f"Generating {m_type} - {level}...")
-                for _ in range(per_level):
-                    maze = self.generate_maze(w, h, m_type)
-                    path, steps = self.solve_astar(maze)
-                    path_filename = f"maze_{maze_id}_path.npy"
-                    np.save(os.path.join(self.save_dir, path_filename), np.array(path, dtype=np.int16))
-                    
-                    filename = f"maze_{maze_id}.npy"
-                    np.save(os.path.join(self.save_dir, filename), maze)
-                    
-                    all_mazes[maze_id] = maze
-                    
-                    dataset.append({
+
+        for m_type, count in [("perfect", per_type), ("imperfect", total - per_type)]:
+            print(f"Generating {count} mazes ({m_type}) for {level_name} ({height}x{width})...")
+            for _ in range(count):
+                maze = self.generate_maze(width, height, m_type)
+                path, steps = self.solve_astar(maze)
+
+                base = f"maze_{maze_id}"
+                maze_file = f"{base}.npy"
+                path_file = f"{base}_path.npy"
+
+                np.save(os.path.join(level_dir, maze_file), maze)
+                np.save(os.path.join(level_dir, path_file), np.array(path, dtype=np.int16))
+
+                records.append(
+                    {
                         "id": maze_id,
-                        "filename": filename,
+                        "filename": maze_file,
                         "type": m_type,
-                        "difficulty": level,
-                        "height": h,
-                        "width": w,
+                        "difficulty": level_name,
+                        "height": height,
+                        "width": width,
                         "optimal_steps": steps,
-                        "path_file": path_filename
-                    })
-                    maze_id += 1
-        
-        # Shuffle once and create an 80/20 train/test split
-        df = pd.DataFrame(dataset).sample(frac=1, random_state=42).reset_index(drop=True)
-        split_idx = int(len(df) * 0.8)
+                        "path_file": path_file,
+                    }
+                )
+                maze_id += 1
+
+        df = pd.DataFrame(records).sample(frac=1, random_state=42).reset_index(drop=True)
+        split_idx = int(len(df) * 0.9)
         df["split"] = "train"
         df.loc[split_idx:, "split"] = "test"
-
-        df.to_csv(os.path.join(self.save_dir, "maze_metadata.csv"), index=False)
-        print(f"Dataset generated with {len(df)} mazes.")
+        meta_path = os.path.join(level_dir, "maze_metadata.csv")
+        df.to_csv(meta_path, index=False)
+        print(f"{level_name}: saved {len(df)} mazes to {level_dir} (metadata: {meta_path})")
         return df
+
+    def generate_dataset(self):
+        """
+        Generate 3 datasets (Easy/Medium/Hard), each with 4000 mazes (half perfect, half imperfect).
+        Stores each difficulty in its own subdirectory named by dimensions, e.g., data/2121 for Medium (21x21).
+        """
+        print("Generating datasets...")
+        levels = [("Easy", 11, 11), ("Medium", 21, 21), ("Hard", 31, 31)]
+        summaries = {}
+        for name, h, w in levels:
+            summaries[name] = self._generate_level(name, w, h, total=4000)
+        return summaries
 
 if __name__ == "__main__":
     gen = MazeGenerator()

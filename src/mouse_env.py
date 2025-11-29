@@ -295,6 +295,9 @@ class MouseMazeEnvLegacy(gym.Env):
         self.stall_steps = 0
         self.last_smell = self._smell_intensity() if self.use_smell else None
         self.visit_counts = {}
+        self.font = None
+        self.mouse_surface = None
+        self.cheese_surface = None
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -398,6 +401,27 @@ class MouseMazeEnvLegacy(gym.Env):
         if self.clock is None and self.render_mode == "human":
             self.clock = pygame.time.Clock()
 
+        # Lazy init font/emoji surfaces
+        if self.font is None:
+            try:
+                self.font = pygame.font.SysFont(None, self.cell_size)
+            except Exception:
+                self.font = None
+
+        def make_emoji_surface(char):
+            if self.font is None:
+                return None
+            try:
+                surf = self.font.render(char, True, (0, 0, 0))
+                return pygame.transform.scale(surf, (self.cell_size, self.cell_size))
+            except Exception:
+                return None
+
+        if self.mouse_surface is None:
+            self.mouse_surface = make_emoji_surface("🐭")
+        if self.cheese_surface is None:
+            self.cheese_surface = make_emoji_surface("🧀")
+
         canvas = pygame.Surface((self.width * self.cell_size, self.height * self.cell_size))
         canvas.fill((255, 255, 255))
 
@@ -405,22 +429,42 @@ class MouseMazeEnvLegacy(gym.Env):
             for c in range(self.width):
                 color = (255, 255, 255)
                 if self.grid[r, c] == 1:
-                    color = (0, 0, 0)
+                    color = (160, 32, 240)  # purple walls
+                    pygame.draw.rect(
+                        canvas,
+                        color,
+                        pygame.Rect(c * self.cell_size, r * self.cell_size, self.cell_size, self.cell_size),
+                    )
                 elif (r, c) == self.goal_pos:
-                    color = (255, 215, 0)
-                pygame.draw.rect(
-                    canvas,
-                    color,
-                    pygame.Rect(c * self.cell_size, r * self.cell_size, self.cell_size, self.cell_size),
-                )
+                    if self.cheese_surface is not None:
+                        canvas.blit(self.cheese_surface, (c * self.cell_size, r * self.cell_size))
+                    else:
+                        color = (255, 215, 0)
+                        pygame.draw.rect(
+                            canvas,
+                            color,
+                            pygame.Rect(c * self.cell_size, r * self.cell_size, self.cell_size, self.cell_size),
+                        )
+                else:
+                    pygame.draw.rect(
+                        canvas,
+                        color,
+                        pygame.Rect(c * self.cell_size, r * self.cell_size, self.cell_size, self.cell_size),
+                    )
 
         agent_color = (128, 128, 128)
-        pygame.draw.circle(
-            canvas,
-            agent_color,
-            (int((self.agent_pos[1] + 0.5) * self.cell_size), int((self.agent_pos[0] + 0.5) * self.cell_size)),
-            self.cell_size // 3,
-        )
+        if self.mouse_surface is not None:
+            canvas.blit(
+                self.mouse_surface,
+                (int(self.agent_pos[1] * self.cell_size), int(self.agent_pos[0] * self.cell_size)),
+            )
+        else:
+            pygame.draw.circle(
+                canvas,
+                agent_color,
+                (int((self.agent_pos[1] + 0.5) * self.cell_size), int((self.agent_pos[0] + 0.5) * self.cell_size)),
+                self.cell_size // 3,
+            )
 
         if self.render_mode == "human":
             self.window.blit(canvas, (0, 0))

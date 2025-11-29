@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from stable_baselines3.common.monitor import Monitor
 
 from src.maze_generator import MazeGenerator
-from src.mouse_env import SimpleMazeEnv
+from src.mouse_env import SimpleMazeEnv, MouseMazeEnv, MouseMazeEnvLegacy
 from src.agents import (
     get_ppo_model,
     get_dqn_model,
@@ -18,8 +18,8 @@ from src.agents import (
     QLearningAgent,
 )
 
-DATA_DIR = "data"
-MODEL_DIR = "models"
+DATA_DIR_BASE = "src/data"  # per-difficulty folders (1111, 2121, 3131)
+MODEL_DIR = "trained_models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 
@@ -28,32 +28,38 @@ def ea_checkpoint_path(env_name: str):
 
 
 def make_env(maze, optimal_path=None, render_mode=None, env_name="simple"):
+    if env_name == "mouse":
+        # Use legacy straight-move FoV env (closest to prior imitation setup)
+        return MouseMazeEnvLegacy(maze, optimal_path=optimal_path, render_mode=render_mode)
     return SimpleMazeEnv(maze, render_mode=render_mode)
 
 def load_random_maze(complexity="Easy", split="train", maze_type=None):
-    """Loads a random maze of specific difficulty (and optional type) from dataset"""
-    meta_path = os.path.join(DATA_DIR, "maze_metadata.csv")
+    """Loads a random maze of specific difficulty (and optional type) from per-difficulty dataset."""
+    subdir_map = {"Easy": "1111", "Medium": "2121", "Hard": "3131"}
+    subdir = subdir_map.get(complexity, "2121")
+    data_dir = os.path.join(DATA_DIR_BASE, subdir)
+    meta_path = os.path.join(data_dir, "maze_metadata.csv")
     if not os.path.exists(meta_path):
-        print("No dataset found. Run generation first.")
+        print(f"No dataset found at {meta_path}. Run generation first.")
         return None
-    
+
     df = pd.read_csv(meta_path)
-    filtered = df[df["difficulty"] == complexity]
-    if maze_type:
+    filtered = df[df["difficulty"] == complexity] if "difficulty" in df.columns else df
+    if maze_type and "type" in df.columns:
         filtered = filtered[filtered["type"] == maze_type]
     if "split" in filtered.columns and split:
         filtered = filtered[filtered["split"] == split]
     if filtered.empty:
         return None
-    
+
     row = filtered.sample(1).iloc[0]
-    maze = np.load(os.path.join(DATA_DIR, row["filename"]))
+    maze = np.load(os.path.join(data_dir, row["filename"]))
     path = None
     if "path_file" in row and isinstance(row["path_file"], str):
-        path_path = os.path.join(DATA_DIR, row["path_file"])
+        path_path = os.path.join(data_dir, row["path_file"])
         if os.path.exists(path_path):
             path = np.load(path_path)
-    return maze, row["optimal_steps"], path
+    return maze, row.get("optimal_steps", -1), path
 
 
 def _direction_to_action(prev, curr):
@@ -485,9 +491,9 @@ if __name__ == "__main__":
     parser.add_argument("--complexity", choices=["perfect", "imperfect"], default=None, help="Maze type filter (used for qlearn/visualize).")
     parser.add_argument(
         "--env",
-        choices=["simple"],
+        choices=["simple", "mouse"],
         default="simple",
-        help="Environment type to use (simple env recommended for Q-learning).",
+        help="Environment type to use.",
     )
     parser.add_argument("--eval-runs", type=int, default=50, help="Number of evaluation runs (for evaluate mode).")
     
@@ -495,7 +501,7 @@ if __name__ == "__main__":
     env_name = args.env
     
     if args.mode == "generate":
-        gen = MazeGenerator(DATA_DIR)
+        gen = MazeGenerator(DATA_DIR_BASE)
         gen.generate_dataset()
     elif args.mode == "train":
         # Use more episodes for Q-learning on Medium mazes

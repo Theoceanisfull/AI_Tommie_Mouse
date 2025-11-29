@@ -4,11 +4,11 @@ Reinforcement Learning project where a mouse agent learns to navigate 2D mazes t
 
 ## Features
 - Custom Gymnasium environments:
-  - `mouse` (default): PyGame rendering, egocentric sensing, turn memory, walk/run dynamics, smell shaping toward cheese.
-  - `simple`: 4-action walls/direction-to-goal observation, designed for evolutionary search.
-- 4,000 generated mazes (easy/medium/hard; perfect + imperfect) with A* optimal paths and lengths; train/test split baked into metadata.
-- Baseline algorithms: PPO, DQN, Evolutionary Algorithm, Imitation Learning (A* demonstrations), and tabular Q-Learning.
-- Standalone Q-Learning/DQN experiments with curriculum, single-maze and multi-maze trainers, and evaluation GIF/plots.
+  - `mouse`: PyGame rendering, egocentric FoV, turn memory, smell signal; legacy straight-move control used by imitation scripts.
+  - `simple`: 4-action, walls + goal-direction observation; tuned for EA/tabular/Q-learning/DQN baselines.
+- 4,000 generated mazes per difficulty (easy 11x11, medium 21x21, hard 31x31; perfect + imperfect) with A* optimal paths and lengths; stored under `src/data/{1111,2121,3131}` with `maze_metadata.csv`.
+- Baseline algorithms: PPO, DQN, Evolutionary Algorithm, Imitation Learning (A* demonstrations), tabular Q-Learning; curriculum DQN scripts.
+- Standalone trainers produce plots/GIFs under their local `metrics/` and save weights to `trained_models/`.
 
 ## Quick Start
 ```bash
@@ -43,12 +43,19 @@ python main.py --mode train --algo qlearn --env mouse
 python main.py --mode train --algo imitation --env mouse
 
 # Standalone trainers (Q-Learning folder; metrics stored in Q-Learning/metrics, models in trained_models/)
-# Single-maze DQN curriculum on a fixed maze (../data/maze_755.npy)
+# Single-maze DQN curriculum on a fixed hard maze (../src/data/3131/maze_1.npy)
 python Q-Learning/DQN_Single.py
 # Multi-maze DQN curriculum on Medium (21x21) mazes using metadata in data/2121 (90/10 split)
 python Q-Learning/DQN_Multi.py
+# Tabular Q-learning baseline and test runner
+python Q-Learning/q_learning.py
+python Q-Learning/test_dqn.py --render --maze ../src/data/2121/maze_757.npy --gif metrics/dqn_test.gif
+
+# Imitation learning (A* demonstrations on hard mazes)
+python Imitation-Learning/imitation_single.py   # single 31x31 maze, saves GIF/metrics/model
+python Imitation-Learning/imitation_multi.py    # trains on 90% of src/data/3131, tests on 10%, saves metrics/plots/model
 ```
-Training outputs go to `trained_models/` when available (e.g., `qlearn_training.png`, `imitation_training.png`) and prints evaluation summaries (success rate, step ratio vs. optimal). Each trainer folder (e.g., `Q-Learning/`) has its own `metrics/` for plots/GIFs.
+Training outputs go to `trained_models/` and each trainer’s local `metrics/` (plots, CSVs, GIFs). Scripts print evaluation summaries (success rate, step ratio vs optimal).
 
 3) **Visualize a trained agent** (PyGame)
 ```bash
@@ -64,23 +71,25 @@ python Q-Learning/test_dqn.py --batch ../data/maze_757.npy ../data/maze_755.npy
 ```
 
 ## Environment Details
-- **mouse env**: length-12 egocentric observation (front/left/right cells, orientation one-hot, turn memory, normalized velocity, smell signal), 8 actions (walk/run in 4 directions), rewards with cheese bonus, wall penalties, smell/optimal-path shaping, and speed nuances.
+- **mouse env (legacy straight-move)**: 8-tile FoV + orientation one-hot + turn memory + optional smell; 4 actions (Up/Right/Down/Left); start=2, goal=3 markers required.
 - **simple env**: 6-D observation (walls up/right/down/left, normalized goal direction), 4 actions (up/right/down/left), sparse shaping toward goal, lighter dynamics tailored for evolutionary search.
+- Custom renderers: purple walls, mouse/cheese icons (pygame); start=2, goal=3 must exist or scripts will raise.
 
 ## Notes on Imitation Learning
-- Collects expert (obs, action) pairs by following stored A* shortest paths from `maze_metadata.csv` (train split).
-- If `path_file` entries are missing, regenerate data with `python main.py --mode generate` to recreate both mazes and optimal paths.
+- Uses A* paths stored in `maze_metadata.csv` (`path_file` column) to collect (obs, action) pairs with `MouseMazeEnvLegacy`.
+- If any `path_file` is missing, regenerate data with `python main.py --mode generate` or `python src/maze_generator.py` to recreate mazes and optimal paths.
+- `imitation_single.py` trains/evals on one hard maze (31x31) and writes loss plot + eval GIF to `Imitation-Learning/metrics/`.
+- `imitation_multi.py` trains on 90% of `src/data/3131`, tests on 10%; saves loss, eval CSVs (train/test), and eval plots to `Imitation-Learning/metrics/`, model to `trained_models/imitation_multi.pth`.
 
 ## Standalone DQN/Q-Learning (Q-Learning folder)
-- `DQN_Single.py`: curriculum DQN on a single 21x21 maze (`../data/maze_755.npy`), saves model + reward plot + eval GIF.
-- `DQN_Multi.py`: curriculum DQN across the Medium dataset (`data/2121`, 90/10 split), saves model, reward/success plots, test metrics CSV, and eval GIF.
+- `DQN_Single.py`: curriculum DQN on a single hard maze (`../src/data/3131/maze_1.npy`), saves model + reward plot + eval GIF (warns if goal not reached).
+- `DQN_Multi.py`: curriculum DQN across the Medium dataset (`src/data/2121`, 90/10 split), saves model, reward/success plots, test metrics CSV, and eval GIF.
 - `test_dqn.py`: load a saved DQN and run a greedy rollout on any maze, with optional render and GIF export.
 
 ## Repo Structure (recommended)
-- `data/` (and per-difficulty subfolders like `data/2121/`)
-- `trained_models/` (all saved weights/checkpoints)
-- `Q-Learning/` (tabular + DQN experiments, with `metrics/`)
-- `Imitation-Learning/` (imitation-specific scripts/tests, with `metrics/`)
-- `EA/` (evolutionary scripts/tests, with `metrics/`)
-- `PPO/` (ppo/dqn classic runs if separated, with `metrics/`)
-- `src/` (shared code: envs, agents, main CLI)
+- `src/data/{1111,2121,3131}`: generated mazes + metadata + optimal paths
+- `trained_models/`: all saved weights/checkpoints
+- `Q-Learning/`: tabular + DQN experiments, with `metrics/`
+- `Imitation-Learning/`: imitation scripts/tests, with `metrics/`
+- `EA/`, `PPO/`: evolutionary and PPO baselines (each with `metrics/` if used)
+- `src/`: shared code (envs, agents, main CLI)

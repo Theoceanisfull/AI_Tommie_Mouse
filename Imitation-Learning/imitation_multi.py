@@ -16,11 +16,10 @@ DATA_DIR = os.path.join(ROOT, "src", "data", "3131")
 META_PATH = os.path.join(DATA_DIR, "maze_metadata.csv")
 METRICS_DIR = os.path.join(os.path.dirname(__file__), "metrics")
 MODEL_PATH = os.path.join(ROOT, "trained_models", "imitation_multi.pth")
-EPOCHS = 100
-BATCH_SIZE = 128
+EPOCHS = 10 # Increased 
+BATCH_SIZE = 64 # Decreased Batch Size
 STEP_MULTIPLIER = 2.0  # allow more steps during eval to reduce timeouts
-OBS_NOISE_STD = 0.01   # small Gaussian noise for regularization
-
+OBS_NOISE_STD = 0.001 # small Gaussian noise for regularization; changed from 0.01 -> 
 
 def direction_to_action(prev, curr):
     dr = curr[0] - prev[0]
@@ -65,7 +64,18 @@ def eval_split(agent, df):
     for _, row in df.iterrows():
         maze = np.load(os.path.join(DATA_DIR, row["filename"]))
         path_file = row.get("path_file", None)
-        optimal_steps = row.get("optimal_steps", -1)
+        # Derive optimal steps from path file when available; fall back to metadata
+        optimal_steps = None
+        if isinstance(path_file, str) and os.path.exists(os.path.join(DATA_DIR, path_file)):
+            try:
+                opt_path = np.load(os.path.join(DATA_DIR, path_file))
+                optimal_steps = max(1, len(opt_path) - 1)
+            except Exception:
+                optimal_steps = None
+        if optimal_steps is None:
+            meta_opt = row.get("optimal_steps", None)
+            if meta_opt is not None and meta_opt > 0:
+                optimal_steps = meta_opt
         if 2 not in maze or 3 not in maze:
             raise ValueError(f"Maze {row['filename']} missing start (2) or goal (3) markers.")
         env = MouseMazeEnvLegacy(maze, optimal_path=None, render_mode=None)
@@ -86,10 +96,15 @@ def eval_split(agent, df):
                 truncated_flag = True
                 break
         env.close()
-        step_ratio = steps / max(1, optimal_steps)
+        # Only compute ratio if we have a valid optimal and the agent actually finished
+        if success and optimal_steps is not None and optimal_steps > 0:
+            step_ratio = steps / optimal_steps
+        else:
+            step_ratio = np.nan
         records.append(
             {
                 "filename": row["filename"],
+                "complexity": row.get("complexity", "unknown"),
                 "success": success,
                 "steps": steps,
                 "step_ratio": step_ratio,
@@ -114,10 +129,33 @@ def train_imitation_multi():
         meta.loc[split_idx:, "split"] = "test"
         meta.to_csv(META_PATH, index=False)
 
+    # Compute a path length column (prefer metadata, fallback to path file length)
+    if "path_len" not in meta.columns:
+        meta["path_len"] = np.nan
+    for i, row in meta.iterrows():
+        if pd.notna(meta.at[i, "path_len"]) and meta.at[i, "path_len"] > 0:
+            continue
+        if "optimal_steps" in meta.columns and pd.notna(row.get("optimal_steps", np.nan)):
+            meta.at[i, "path_len"] = row["optimal_steps"]
+            continue
+        path_file = row.get("path_file", None)
+        if isinstance(path_file, str):
+            pfile = os.path.join(DATA_DIR, path_file)
+            if os.path.exists(pfile):
+                try:
+                    p = np.load(pfile)
+                    meta.at[i, "path_len"] = max(1, len(p) - 1)
+                except Exception:
+                    pass
+    meta["path_len"] = meta["path_len"].fillna(meta["path_len"].median())
+
     train_df = meta[meta["split"] == "train"]
     test_df = meta[meta["split"] == "test"]
 
     print(f"Collected {len(train_df)} train mazes, {len(test_df)} test mazes from {DATA_DIR}")
+
+    # Simple reverse curriculum: train on shorter paths first (sorted by path_len)
+    train_df = train_df.sort_values("path_len")
 
     obs_data, act_data = collect_dataset(train_df)
     obs_dim = obs_data.shape[1]
@@ -167,10 +205,12 @@ def train_imitation_multi():
     # Metrics
     train_success = train_eval["success"].mean()
     test_success = test_eval["success"].mean()
-    train_mean = train_eval["step_ratio"].mean()
-    test_mean = test_eval["step_ratio"].mean()
-    train_median = train_eval["step_ratio"].median()
-    test_median = test_eval["step_ratio"].median()
+    train_ratios = train_eval["step_ratio"].dropna()
+    test_ratios = test_eval["step_ratio"].dropna()
+    train_mean = train_ratios.mean()
+    test_mean = test_ratios.mean()
+    train_median = train_ratios.median()
+    test_median = test_ratios.median()
 
     print(f"[Multi Eval] train_success={train_success:.3f}, test_success={test_success:.3f}")
     print(f"[Multi Eval] step_ratio mean (train/test) = {train_mean:.2f}/{test_mean:.2f}")
@@ -188,14 +228,16 @@ def train_imitation_multi():
     axes[0].set_title("Success Rate")
     axes[0].grid(True, axis="y", linestyle="--", alpha=0.5)
 
-    axes[1].boxplot(
-        [train_eval["step_ratio"], test_eval["step_ratio"]],
-        labels=["Train", "Test"],
-        showmeans=True,
-    )
-    axes[1].set_ylabel("Step Ratio (steps/optimal)")
-    axes[1].set_title("Step Ratio Distribution")
-    axes[1].grid(True, axis="y", linestyle="--", alpha=0.5)
+    if len(train_ratios) == 0 and len(test_ratios) == 0:
+        axes[1].text(0.5, 0.5, "No successful episodes to plot", ha="center", va="center")
+        axes[1].set_axis_off()
+    else:
+        box_data = [train_ratios if len(train_ratios) > 0 else [np.nan],
+                    test_ratios if len(test_ratios) > 0 else [np.nan]]
+        axes[1].boxplot(box_data, labels=["Train", "Test"], showmeans=True)
+        axes[1].set_ylabel("Step Ratio (steps/optimal)")
+        axes[1].set_title("Step Ratio Distribution")
+        axes[1].grid(True, axis="y", linestyle="--", alpha=0.5)
 
     plt.tight_layout()
     eval_plot = os.path.join(METRICS_DIR, "imitation_multi_eval.png")

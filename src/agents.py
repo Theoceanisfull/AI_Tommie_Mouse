@@ -1,11 +1,12 @@
 import copy
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from stable_baselines3 import PPO as SB3PPO, DQN as SB3DQN
 
@@ -311,11 +312,11 @@ class ImitationAgent(nn.Module):
         self,
         input_dim,
         output_dim,
-        hidden_dim=256,
-        dropout=0.2,
-        grad_clip=1.0,
-        num_layers=2,
-        lr=0.001,
+        hidden_dim=256, # Changed from 256 - > 512
+        dropout=0.1, #Changed to 0.3 from 0.2
+        grad_clip=2.0, #Changed to 2.0 from 1.0 
+        num_layers=2, # Add 1 layer from 2
+        lr=0.005, #Moved from 0.001 -> 0.005
     ):
         super().__init__()
         self.dropout = dropout
@@ -392,6 +393,194 @@ class ImitationAgent(nn.Module):
         with torch.no_grad():
             logits = self.forward_logits(obs, use_state=True)
             action = torch.argmax(logits).item()
+        return action, None
+
+
+class ImitationMLPAgent(nn.Module):
+    """
+    Simpler feed-forward imitation policy for settings where recurrence is unnecessary.
+    Kept interface-compatible with ImitationAgent (train_step, predict, reset_state).
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims=(256, 256),
+        dropout: float = 0.1,
+        grad_clip: Optional[float] = 2.0,
+        lr: float = 0.005,
+    ):
+        super().__init__()
+        layers: list[nn.Module] = []
+        last = input_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(last, h))
+            layers.append(nn.ReLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            last = h
+        layers.append(nn.Linear(last, output_dim))
+        self.net = nn.Sequential(*layers)
+
+        self.grad_clip = grad_clip
+        self.initial_lr = lr
+        self.optimizer = optim.Adam(self.parameters(), lr=self.initial_lr)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, factor=0.5, patience=5, min_lr=1e-5
+        )
+        self.criterion = nn.CrossEntropyLoss()
+
+    def reset_state(self):
+        # No recurrent state to reset; kept for interface compatibility.
+        return None
+
+    def forward_logits(self, obs):
+        if isinstance(obs, np.ndarray):
+            obs = torch.FloatTensor(obs)
+        if obs.ndim == 1:
+            obs = obs.unsqueeze(0)
+        return self.net(obs)
+
+    def train_step(self, obs_batch, act_batch):
+        self.optimizer.zero_grad()
+        obs = torch.FloatTensor(obs_batch)
+        target = torch.LongTensor(act_batch)
+        logits = self.forward_logits(obs)
+        loss = self.criterion(logits, target)
+        loss.backward()
+        if self.grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip)
+        self.optimizer.step()
+        return loss.item()
+
+    def reset_lr(self):
+        for g in self.optimizer.param_groups:
+            g["lr"] = self.initial_lr
+
+    def step_scheduler(self, metric):
+        if self.scheduler is not None:
+            self.scheduler.step(metric)
+
+    def predict(self, obs, deterministic=True):
+        if isinstance(obs, np.ndarray):
+            obs = torch.FloatTensor(obs).unsqueeze(0)
+        with torch.no_grad():
+            logits = self.forward_logits(obs)
+            action = torch.argmax(logits).item()
+        return action, None
+
+
+class ImitationViTAgent(nn.Module):
+    """
+    ViT-style imitation policy:
+    - Splits the flat observation into fixed-size patches
+    - Applies a Transformer encoder over patch tokens + CLS
+    - Keeps the same train_step/predict interface as other agents
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        patch_size: int = 4,
+        embed_dim: int = 128,
+        depth: int = 4,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+        grad_clip: Optional[float] = 1.0,
+        lr: float = 0.001,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.patch_size = patch_size
+        self.num_patches = int(np.ceil(input_dim / patch_size))
+        self.grad_clip = grad_clip
+        self.initial_lr = lr
+
+        self.patch_embed = nn.Linear(patch_size, embed_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, embed_dim))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, output_dim)
+
+        self.optimizer = optim.Adam(self.parameters(), lr=self.initial_lr)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, factor=0.5, patience=4, min_lr=1e-5
+        )
+        self.criterion = nn.CrossEntropyLoss()
+
+        # Initialize pos/cls similar to standard ViT
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+    def reset_state(self):
+        # Stateless transformer; kept for API parity
+        return None
+
+    def _to_tokens(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        obs: (batch, input_dim) or (input_dim,)
+        returns tokens with cls included: (batch, num_patches+1, embed_dim)
+        """
+        if isinstance(obs, np.ndarray):
+            obs = torch.as_tensor(obs, dtype=torch.float32)
+        if obs.ndim == 1:
+            obs = obs.unsqueeze(0)
+
+        bsz, feat_dim = obs.shape
+        pad = self.num_patches * self.patch_size - feat_dim
+        if pad > 0:
+            obs = F.pad(obs, (0, pad))
+
+        patches = obs.view(bsz, self.num_patches, self.patch_size)
+        tokens = self.patch_embed(patches)
+        cls = self.cls_token.expand(bsz, -1, -1)
+        tokens = torch.cat([cls, tokens], dim=1)
+        tokens = tokens + self.pos_embed[:, : tokens.shape[1]]
+        return tokens
+
+    def forward_logits(self, obs):
+        tokens = self._to_tokens(obs)
+        enc = self.encoder(tokens)
+        cls_repr = self.norm(enc[:, 0])
+        return self.head(cls_repr)
+
+    def train_step(self, obs_batch, act_batch):
+        self.optimizer.zero_grad()
+        obs = torch.as_tensor(obs_batch, dtype=torch.float32)
+        target = torch.as_tensor(act_batch, dtype=torch.long)
+        logits = self.forward_logits(obs)
+        loss = self.criterion(logits, target)
+        loss.backward()
+        if self.grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip)
+        self.optimizer.step()
+        return loss.item()
+
+    def reset_lr(self):
+        for g in self.optimizer.param_groups:
+            g["lr"] = self.initial_lr
+
+    def step_scheduler(self, metric):
+        if self.scheduler is not None:
+            self.scheduler.step(metric)
+
+    def predict(self, obs, deterministic=True):
+        if isinstance(obs, np.ndarray):
+            obs = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            logits = self.forward_logits(obs)
+            action = torch.argmax(logits, dim=1).item()
         return action, None
 
 

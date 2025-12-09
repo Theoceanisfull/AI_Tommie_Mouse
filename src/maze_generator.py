@@ -12,9 +12,18 @@ CELL_WALL = 1
 CELL_START = 2
 CELL_GOAL = 3
 
+# Action ordering aligns with MouseMazeEnvLegacy: 0=Up, 1=Right, 2=Down, 3=Left
+ACTION_UP = 0
+ACTION_RIGHT = 1
+ACTION_DOWN = 2
+ACTION_LEFT = 3
+ACTION_NONE = -1
+
 class MazeGenerator:
-    def __init__(self, save_dir="data"):
+    def __init__(self, save_dir="data", include_flow_fields: bool = True):
         self.save_dir = save_dir
+        # When True, also emit per-cell distance and action maps alongside paths
+        self.include_flow_fields = include_flow_fields
         os.makedirs(save_dir, exist_ok=True)
 
     def generate_maze(self, width, height, complexity="perfect"):
@@ -123,6 +132,61 @@ class MazeGenerator:
         path.append(start)
         return path[::-1], len(path) - 1
 
+    def compute_dist_action_maps(self, maze):
+        """
+        Compute a distance-to-goal field and greedy action map from any cell.
+        Action order matches MouseMazeEnvLegacy (Up, Right, Down, Left).
+        """
+        h, w = maze.shape
+        goal = tuple(np.argwhere(maze == CELL_GOAL)[0])
+
+        dist_map = np.full((h, w), np.inf, dtype=np.float32)
+        dist_map[goal] = 0.0
+        queue = [(0.0, goal)]
+        visited = set()
+
+        while queue:
+            curr_dist, (r, c) = heapq.heappop(queue)
+            if (r, c) in visited:
+                continue
+            visited.add((r, c))
+            for dr, dc in [(-1, 0), (0, 1), (1, 0), (0, -1)]:  # up, right, down, left
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < h and 0 <= nc < w and maze[nr, nc] != CELL_WALL:
+                    new_dist = curr_dist + 1
+                    if new_dist < dist_map[nr, nc]:
+                        dist_map[nr, nc] = new_dist
+                        heapq.heappush(queue, (new_dist, (nr, nc)))
+
+        action_map = np.full((h, w), ACTION_NONE, dtype=np.int8)
+        for r in range(h):
+            for c in range(w):
+                if maze[r, c] == CELL_WALL or (r, c) == goal:
+                    continue
+                neighbors = [
+                    (r - 1, c, ACTION_UP),
+                    (r, c + 1, ACTION_RIGHT),
+                    (r + 1, c, ACTION_DOWN),
+                    (r, c - 1, ACTION_LEFT),
+                ]
+                best_action = ACTION_NONE
+                best_dist = dist_map[r, c]
+                for nr, nc, act in neighbors:
+                    if 0 <= nr < h and 0 <= nc < w:
+                        if dist_map[nr, nc] < best_dist:
+                            best_dist = dist_map[nr, nc]
+                            best_action = act
+                action_map[r, c] = best_action
+
+        finite = dist_map[np.isfinite(dist_map)]
+        if finite.size > 0 and finite.max() > 0:
+            norm_dist_map = 1.0 - (dist_map / finite.max())
+            norm_dist_map[~np.isfinite(norm_dist_map)] = 0.0
+        else:
+            norm_dist_map = dist_map
+
+        return norm_dist_map.astype(np.float32), action_map
+
     def _generate_level(self, level_name, width, height, total=4000):
         """
         Generate a full dataset for a single difficulty level.
@@ -141,12 +205,22 @@ class MazeGenerator:
                 maze = self.generate_maze(width, height, m_type)
                 path, steps = self.solve_astar(maze)
 
+                dist_map = None
+                action_map = None
+                if self.include_flow_fields:
+                    dist_map, action_map = self.compute_dist_action_maps(maze)
+
                 base = f"maze_{maze_id}"
                 maze_file = f"{base}.npy"
                 path_file = f"{base}_path.npy"
+                dist_file = f"{base}_dist.npy" if self.include_flow_fields else None
+                action_file = f"{base}_actions.npy" if self.include_flow_fields else None
 
                 np.save(os.path.join(level_dir, maze_file), maze)
                 np.save(os.path.join(level_dir, path_file), np.array(path, dtype=np.int16))
+                if self.include_flow_fields and dist_map is not None and action_map is not None:
+                    np.save(os.path.join(level_dir, dist_file), dist_map)
+                    np.save(os.path.join(level_dir, action_file), action_map)
 
                 records.append(
                     {
@@ -158,6 +232,9 @@ class MazeGenerator:
                         "width": width,
                         "optimal_steps": steps,
                         "path_file": path_file,
+                        "path_len": steps,
+                        "dist_file": dist_file,
+                        "action_file": action_file,
                     }
                 )
                 maze_id += 1

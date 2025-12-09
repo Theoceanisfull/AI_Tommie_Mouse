@@ -20,6 +20,15 @@ EPOCHS = 10 # Increased
 BATCH_SIZE = 64 # Decreased Batch Size
 STEP_MULTIPLIER = 2.0  # allow more steps during eval to reduce timeouts
 OBS_NOISE_STD = 0.001 # small Gaussian noise for regularization; changed from 0.01 -> 
+USE_FLOW_FIELD = True  # use action_map supervision when available (requires regenerated data)
+USE_RL_FINETUNE = True  # fine-tune with reward signals after BC
+RL_EPISODES = 400
+RL_GAMMA = 0.99
+RL_ENTROPY_BETA = 0.01
+RL_CLIP_GRAD = 1.0
+ADAPT_DURING_TEST = False  # disable eval-time adaptation for stability
+LR_OVERRIDE = 0.001  # lower LR for stability during BC/RL fine-tune
+EPOCHS = 20  # train longer for BC stability
 
 def direction_to_action(prev, curr):
     dr = curr[0] - prev[0]
@@ -59,6 +68,71 @@ def collect_dataset(df):
     return np.array(observations, dtype=np.float32), np.array(actions, dtype=np.int64)
 
 
+def collect_dataset_from_flow(df):
+    """
+    Build a dense imitation dataset using the precomputed flow-field action map.
+    Uses MouseMazeEnvLegacy so observations match training/inference time.
+    """
+    observations = []
+    actions = []
+    for _, row in df.iterrows():
+        maze = np.load(os.path.join(DATA_DIR, row["filename"]))
+        action_file = row.get("action_file", None)
+        if not isinstance(action_file, str):
+            continue
+        action_path = os.path.join(DATA_DIR, action_file)
+        if not os.path.exists(action_path):
+            continue
+
+        action_map = np.load(action_path)
+        if 2 not in maze or 3 not in maze:
+            raise ValueError(f"Maze {row['filename']} missing start (2) or goal (3) markers.")
+
+        env = MouseMazeEnvLegacy(maze, optimal_path=None, render_mode=None)
+        obs, _ = env.reset()
+        steps = 0
+        max_steps = env.max_steps
+
+        # Follow the greedy flow-field until goal or truncation
+        while steps < max_steps:
+            r, c = env.agent_pos
+            act = int(action_map[r, c])
+            if act < 0:
+                break
+            observations.append(obs)
+            obs, _, terminated, truncated, _ = env.step(act)
+            actions.append(act)
+            steps += 1
+            if terminated or truncated:
+                break
+        env.close()
+
+    return np.array(observations, dtype=np.float32), np.array(actions, dtype=np.int64)
+
+
+def policy_gradient_update(agent, log_probs, entropies, rewards):
+    """
+    Vanilla REINFORCE with entropy bonus and simple normalized returns.
+    """
+    returns = []
+    g = 0.0
+    for r in reversed(rewards):
+        g = r + RL_GAMMA * g
+        returns.append(g)
+    returns = list(reversed(returns))
+    returns_t = torch.tensor(returns, dtype=torch.float32)
+    if len(returns_t) > 1:
+        returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-6)
+
+    logp_t = torch.stack(log_probs)
+    entropy_t = torch.stack(entropies) if entropies else torch.tensor(0.0)
+    loss = -(logp_t * returns_t).mean() - RL_ENTROPY_BETA * entropy_t.mean()
+    agent.optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(agent.parameters(), RL_CLIP_GRAD)
+    agent.optimizer.step()
+
+
 def eval_split(agent, df):
     records = []
     for _, row in df.iterrows():
@@ -85,9 +159,22 @@ def eval_split(agent, df):
         success = False
         truncated_flag = False
         max_steps = int(env.max_steps * STEP_MULTIPLIER)
+        log_probs = []
+        entropies = []
+        rewards = []
         while steps < max_steps:
-            action, _ = agent.predict(obs, deterministic=True)
-            obs, _, terminated, truncated, _ = env.step(action)
+            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+            logits = agent.forward_logits(obs_t, use_state=True)
+            dist = torch.distributions.Categorical(logits=logits)
+            if ADAPT_DURING_TEST:
+                action = dist.sample().item()
+                log_probs.append(dist.log_prob(torch.tensor(action)))
+                entropies.append(dist.entropy())
+            else:
+                action = torch.argmax(logits).item()
+            obs, reward, terminated, truncated, _ = env.step(action)
+            if ADAPT_DURING_TEST:
+                rewards.append(reward)
             steps += 1
             if terminated:
                 success = True
@@ -96,6 +183,8 @@ def eval_split(agent, df):
                 truncated_flag = True
                 break
         env.close()
+        if ADAPT_DURING_TEST and log_probs:
+            policy_gradient_update(agent, log_probs, entropies, rewards)
         # Only compute ratio if we have a valid optimal and the agent actually finished
         if success and optimal_steps is not None and optimal_steps > 0:
             step_ratio = steps / optimal_steps
@@ -157,11 +246,21 @@ def train_imitation_multi():
     # Simple reverse curriculum: train on shorter paths first (sorted by path_len)
     train_df = train_df.sort_values("path_len")
 
-    obs_data, act_data = collect_dataset(train_df)
+    if USE_FLOW_FIELD:
+        obs_data, act_data = collect_dataset_from_flow(train_df)
+        print(f"[Multi] Flow-field dataset size: {len(obs_data)}")
+        if len(obs_data) == 0:
+            print("[Multi] Flow-field data empty; falling back to path-based dataset.")
+            obs_data, act_data = collect_dataset(train_df)
+    else:
+        obs_data, act_data = collect_dataset(train_df)
     obs_dim = obs_data.shape[1]
     n_actions = 4
 
     agent = ImitationAgent(obs_dim, n_actions)
+    if LR_OVERRIDE is not None:
+        for g in agent.optimizer.param_groups:
+            g["lr"] = LR_OVERRIDE
 
     losses = []
     for epoch in range(EPOCHS):
@@ -184,6 +283,39 @@ def train_imitation_multi():
 
     torch.save(agent.state_dict(), MODEL_PATH)
     print(f"Saved imitation multi model to {MODEL_PATH}")
+
+    # --- RL Fine-tuning with rewards ---
+    if USE_RL_FINETUNE:
+        agent.train()
+        for ep in range(RL_EPISODES):
+            rec = train_df.sample(1).iloc[0]
+            maze = np.load(os.path.join(DATA_DIR, rec["filename"]))
+            env = MouseMazeEnvLegacy(maze, optimal_path=None, render_mode=None)
+            obs, _ = env.reset()
+            agent.reset_state()
+            log_probs = []
+            entropies = []
+            rewards = []
+            steps = 0
+            max_steps = int(env.max_steps * STEP_MULTIPLIER)
+            while steps < max_steps:
+                obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+                logits = agent.forward_logits(obs_t, use_state=True)
+                dist = torch.distributions.Categorical(logits=logits)
+                action = dist.sample()
+                obs, reward, terminated, truncated, _ = env.step(action.item())
+                log_probs.append(dist.log_prob(action))
+                entropies.append(dist.entropy())
+                rewards.append(reward)
+                steps += 1
+                if terminated or truncated:
+                    break
+            env.close()
+            if log_probs:
+                policy_gradient_update(agent, log_probs, entropies, rewards)
+            if (ep + 1) % 50 == 0:
+                ep_ret = sum(rewards)
+                print(f"[Multi RL] Episode {ep+1}/{RL_EPISODES} return={ep_ret:.2f}")
 
     # Training loss plot
     plt.figure()
